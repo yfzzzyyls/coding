@@ -293,6 +293,42 @@ Must check both EX pipes against both ID instructions: 2 EX loads × 4 ID operan
 
 The forwarding network and multi-port register file are the main area/timing costs. This is why most designs cap at 4-6 wide — the forwarding network grows as O(width²).
 
+### Pipeline Deep-Dive Quiz (2026-04-02)
+
+**Q50. What is `rs1_data` in the pipeline — register or wire? What drives it?**
+Wire (combinational signal). Driven by the forwarding mux output. The mux selects between `mem_result` (from EX/MEM stage), `mem_wb.result` (from MEM/WB stage), or `regfile[rs1]` (default). The wire connects the forwarding mux output to the `id_ex.rs1_data` pipeline register input.
+
+**Q51. Why does the forwarding mux use `mem_result` instead of `ex_mem.alu_result`?**
+For ALU instructions, `ex_mem.alu_result` is the correct result. But for LOADs, `ex_mem.alu_result` holds the **memory address**, not the loaded data. `mem_result` is the output of the MEM-stage mux: it reads `dmem[addr]` for LOADs and passes through `alu_result` for ALU ops. So `mem_result` always has the correct value regardless of instruction type.
+
+**Q52. What is the critical path in a 5-stage pipeline with forwarding? Trace the full chain.**
+The MEM-to-ID forwarding path for LOADs:
+`ex_mem (Q output)` → load/ALU mux (`mem_read` select) → SRAM read (`dmem[addr]`) → forwarding mux (comparator + select) → `id_ex (D input)`
+This is two muxes plus an SRAM access in one cycle. The SRAM access dominates. Fix: split MEM into 2 stages, or accept a 2-cycle load-use penalty.
+
+**Q53. During a load-use stall, what happens to `if_id` and `id_ex` on the same clock edge?**
+- `if_id` **holds** its current value (keeps the instruction for retry next cycle)
+- `id_ex` is **flushed to zero** (bubble inserted to prevent the held instruction from executing twice)
+Rule: upstream holds, downstream flushes. This happens on a single clock edge.
+
+**Q54. Why don't EX and MEM stages need stall logic?**
+The bubble (`'0`) inserted into `id_ex` during the stall naturally flows downstream through EX → MEM → WB. Those stages always advance unconditionally — they just see a NOP pass through and do nothing. No special logic needed.
+
+**Q55. Why does `if_id <= '0` work as a bubble for a packed struct?**
+`'0` sets all bits to zero. The critical fields: `reg_write=0` (no register write), `mem_read=0` (no memory access), `op=000=OP_NOP`. These ensure the bubble does nothing as it flows through the pipeline. This works because we designed `OP_NOP=0` and all control signals default to inactive at zero.
+
+**Q56. How does the synthesis tool implement the stall (clock enable) on `if_id`?**
+As an ICG (Integrated Clock Gating) cell: a negative-level-sensitive latch + AND gate. When `stall=1`, the ICG blocks the clock — the flip-flop never sees a clock edge, so it holds its value naturally. The latch prevents glitches on the enable signal from creating false clock edges. This saves power vs. the feedback-mux alternative.
+
+**Q57. The forwarding priority is EX/MEM > MEM/WB > regfile. Why does EX/MEM win?**
+EX/MEM holds the **newer** (younger) instruction's result. If two in-flight instructions both write to the same `rd`, the most recent one must win — that's program-order correctness. EX/MEM is closer to ID than MEM/WB, meaning it contains a younger instruction. Forwarding the older value would give the wrong result.
+
+**Q58. With 2 FUs in a 1-wide pipeline, what new forwarding source is needed?**
+`id_ex` — forwarding the **combinational ALU result** from the EX stage. With alternating dispatch to 2 FUs, back-to-back dependent instructions land in different FUs. When the consumer is in ID, the producer is still in `id_ex` (not yet in `ex_mem`). So we must forward from `id_ex` using the combinational ALU output. This doesn't work for LOADs (only have the address), which is why the load-use stall still applies.
+
+**Q59. In OoO designs, why can't we use a single global stall wire?**
+Different structures (issue queue, ROB, load queue, store queue) stall independently. A cache miss stalls only that memory instruction while ALU instructions keep issuing. Queues between stages absorb timing mismatches. Each structure uses its own valid/ready handshake or credit-based flow control instead of a global stall.
+
 ---
 
 ## Day 6: RSD DCache 1R1W Redesign (2026-04-02)
@@ -380,3 +416,63 @@ Do not call it a logic bug. First check whether the program eventually reaches t
 - `DCache` main line and tag storage are now truly integrated to real TSMC16 SRAM macros in the DC flow
 - Small cache-side arrays such as dirty/replacement state are still generic inferred RAM/logic, which is reasonable because they are tiny
 - The remaining runtime bottleneck in full-core synthesis is no longer cache storage. It is the large inferred OoO memories such as issue queues, rename tables, and register-file-related structures
+
+### Follow-On: BTB / Gshare / MDP SRAM Integration
+- Continued the ASIC-minded storage cleanup after finishing `L1I` and `L1D`
+- Chose the next blocks using the rule:
+  - map each structure to the implementation style that makes sense in a real OoO ASIC
+- Result:
+  - `BTB`: moved to real SRAM-backed storage
+  - `Gshare` PHT: moved to real SRAM-backed storage
+  - `MemoryDependencyPredictor`: moved to real SRAM-backed storage
+  - `ReplayQueue`: intentionally left as logic for now
+
+### Why ReplayQueue Was Deferred
+- I tried a `ReplayQueue` SRAM conversion first, but it was not a clean fit
+- The synchronous `1R1W` version passed elaboration but caused real functional regressions in `ReplayQueueTest`
+- That is a sign the queue behavior is more timing-sensitive than the regular predictor/storage tables
+- For this project, it is more realistic to keep `ReplayQueue` as logic for now instead of forcing a bad SRAM mapping
+
+### What Changed In RTL
+- Added [BTBSRAM.sv](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/FetchUnit/BTBSRAM.sv)
+  - replaces the old inferred `BTB` table with banked `128x32` TSMC16 macros
+  - current mapping is `1024 x 19`, implemented as `2` read banks and `4` depth slices per bank
+- Added [GshareSRAM.sv](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/FetchUnit/GshareSRAM.sv)
+  - packs the `2048 x 2` PHT counters into `32-bit` macro words
+  - current mapping is `2` read banks backed by `2` total `128x32` macros
+- Added [MDTSRAM.sv](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/Scheduler/MDTSRAM.sv)
+  - packs the `1024 x 1` memory-dependency bits into `32-bit` macro words
+  - current mapping is `2` read banks backed by `2` total `128x32` macros
+- Rewired:
+  - [BTB.sv](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/FetchUnit/BTB.sv)
+  - [Gshare.sv](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/FetchUnit/Gshare.sv)
+  - [MemoryDependencyPredictor.sv](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/Scheduler/MemoryDependencyPredictor.sv)
+- Updated [CoreSources.inc.mk](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/Makefiles/CoreSources.inc.mk) to compile the new wrappers
+
+### Verification
+- Design Compiler elaboration accepted the new wrappers in the full `Core` hierarchy
+- Rebuilt the Verilator simulator on the SRAM-macro path
+- Focused checks passed:
+  - `ControlTransfer`
+  - `ControlTransferZynq`
+  - `MemoryDependencyPrediction`
+  - standalone `Gshare`
+- Full `test-1` passed again after the BTB/Gshare/MDP integration
+
+### Small Tooling Improvement
+- Updated [Makefile.verilator.mk](/home/fy2243/coding/design_and_perf/rsd_fengze/Processor/Src/Makefile.verilator.mk) to build the generated Verilator C++ model with:
+  - `-j16`
+  - `-fuse-ld=gold`
+- This keeps the regression rebuild practical on the current server
+
+### Honest Status Now
+- `ICache`: SRAM-backed and verified
+- `DCache`: SRAM-backed and verified
+- `BTB`: SRAM-backed and verified
+- `Gshare`: SRAM-backed and verified
+- `MemoryDependencyPredictor`: SRAM-backed and verified
+- `ReplayQueue`: still logic, by design for now
+- Remaining major non-cache/non-predictor blocks are still things like:
+  - issue queue
+  - register file
+  - rename / active-list structures
