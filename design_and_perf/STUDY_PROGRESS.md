@@ -1371,3 +1371,116 @@ Do not call it a logic bug. First check whether the program eventually reaches t
 - The intent is to give the affected tap/followpin rows a nearby capture path into the existing PG mesh without going back to a broad global low-layer mesh.
 - I rebuilt `init` successfully with this patch on the same `RSD_CACHE_SHORT_X_SHIFT=40` floorplan.
 - The matching `place` rerun was started and then intentionally stopped so the current backend-debug state could be committed cleanly before the next measurement.
+
+### Update: Current Best Macro-Present PG Result And Ruled-Out Branches
+- I continued the macro-present PG debug from the `RSD_CACHE_SHORT_X_SHIFT=40` checkpoint and used per-pass connectivity reports to isolate what each `sroute` stage is actually fixing.
+- Current best useful checkpoints are:
+  - after low `corePin -> stripe`: `270` terminal opens + `730` special-wire opens
+  - after an added final `corePin -> ring` edge catch-up pass: `118` terminal opens + `882` special-wire opens in the immediate edge report
+- Interpretation:
+  - the broad edge-ring pass is genuinely fixing a large chunk of the terminal-open problem
+  - but it is also creating too much new special-wire fragmentation to keep as-is
+
+### Update: What I Ruled Out In This Round
+- I tested a mid-layer `corePin -> stripe` lift (`M5..M8`) between the low pass and the edge-ring pass.
+- It did nothing useful:
+  - `Number of Core ports routed: 0 open: 15739`
+- I also tested broader boundary and phase-2 helper strategies:
+  - boundary/top-edge low mesh in the macro-present `pg` path
+  - VSS-only low-layer phase-2 capture
+  - VDD-only low-layer phase-2 capture
+  - VDD-only upper-metal hotspot bridge assist
+- All of those branches were rejected because they reintroduced highly intrusive `IMPPP-133` boundary-expansion behavior or regressed the PG checkpoint back toward `1000` terminal-open failures before the low pass finished.
+
+### Current Understanding Of The Remaining Problem
+- The live macro-present problem is now much narrower than before:
+  - the low `corePin` pass is the stable baseline
+  - a broad edge-ring pass helps terminals but over-fragments special wires
+  - extra low-layer capture ladders are too invasive
+- So the next useful direction is not “more low-layer mesh.”
+- The next useful direction is:
+  - keep the current X-staggered macro floorplan
+  - keep the good low `corePin` baseline
+  - replace the broad edge-ring pass with a narrower upper-level reconnection around only the surviving boundary/cache bands
+
+### Update: VSS-Only Edge Ring Is Real, But VDD Still Needs A Narrower Fix
+- I reran the macro-present `pg` stage on the current best X-staggered floorplan and confirmed the low-pass baseline still reproduces exactly:
+  - `270` terminal opens
+  - `730` special-wire opens
+- I then ran a `VSS`-only edge-ring pass on top of that baseline.
+- Result:
+  - `113` terminal opens
+  - `887` special-wire opens
+- Breakdown from the immediate edge report:
+  - surviving terminals are almost entirely `VDD`
+  - `VSS` terminal opens collapse from `157` down to `1`
+  - the special-wire problem becomes almost entirely `VDD`
+- This proves the edge-ring machinery itself is not useless. It is strongly effective for `VSS`, but too broad for `VDD`.
+
+### Update: VDD-Only Broad Edge Stripe Is Not The Right Follow-Up
+- I tested a `VDD`-only `corePin -> stripe` edge pass as a possible complement to the `VSS`-only ring pass.
+- That branch was not useful:
+  - it was much slower than the `VSS` edge pass
+  - it hit repeated `IMPPP-570` and `IMPPP-531` cut-layer obstruction / via-spacing warnings in the cache windows
+  - it did not produce a clean immediate improvement signal quickly enough to justify keeping it as the next mainline path
+- Conclusion:
+  - `VDD` should not be fixed with another broad edge `sroute`
+  - `VDD` needs a narrower helper than a full edge-side reconnect
+
+### Update: Added Exact-Band VDD Upper Reconnect Helper
+- I added `rsd_add_pg_vdd_upper_band_reconnect` to the Innovus flow.
+- The helper adds only narrow `M10` `VDD` bridges in the exact surviving `VDD` bands from the current best report:
+  - bottom cache around `y ≈ 211/428/497`
+  - right cache around `y ≈ 537/662`
+  - predictor band around `y ≈ 937`
+- I also changed the flow so this helper can be inserted **after** the stable low `corePin` pass and **before** the optional edge pass, instead of perturbing the whole low-pass baseline from the start.
+- The reordered branch has been wired into the flow, but I stopped the long run once it was clear it had not yet produced a new report before the next decision point.
+
+### Current Best Practical Conclusion
+- The strongest proven branch is still:
+  - X-staggered macro floorplan
+  - stable low `corePin -> stripe` baseline
+  - `VSS`-only edge-ring catch-up if we specifically want to eliminate the `VSS` terminal-open side
+- The remaining open technical problem is now very specific:
+  - find a narrow `VDD` reconnect that preserves the `VSS` win without causing the `VDD` special-wire explosion from the broad edge-ring path
+
+### Update: Removed The Main Brute-Force Bottleneck In The PG Debug Flow
+- The real inefficiency in the current backend work was not just the choice of PG experiments. It was that every targeted `VDD`/`VSS` reconnect experiment still had to replay the full macro-present low-pass PG baseline from `prepg.enc`.
+- I patched the flow to add explicit checkpoint stages for that split:
+  - `pg_low`
+  - `pg_edge`
+- New checkpoints in the Innovus flow:
+  - `pg_low.enc`
+  - `pg_edge.enc`
+- The intent is:
+  - build the stable low-pass macro-present baseline once
+  - branch all narrow edge/reconnect experiments from that saved baseline
+  - stop spending multi-minute runtime on the same low `corePin` stage for every hypothesis
+- I also added a dedicated `rsd_pg_sroute_edge_only` path so the edge-side reconnect can be tested independently from the low-pass stages.
+
+### Update: Macro-Present PG Is Now Reduced To A Pure `VDD` Special-Wire Problem
+- I added finer-grain controls for the macro-present `pg_vdd` stage:
+  - selectable `VDD` upper-band reconnect windows
+  - selectable `VDD` column reconnect windows
+  - selectable `VSS` phase-2 capture windows
+  - env controls to skip the helper-local `editPowerVia` passes so stripe geometry can be tested independently from global via stitching
+- The important finding is that the helper stripes themselves, not just the via pass, are what move the result:
+  - `pred_col_left` with helper-local vias disabled still changes the report
+  - so the added geometry is real, not just a side effect of global via insertion
+- The clearest current branch is:
+  - keep the macro-present `pg_edge` baseline
+  - add only `pred_vdd_top`
+  - add only `upper_vss_p2_b` and `upper_vss_p2_c`
+  - keep helper-local via insertion disabled for both
+- Result from that branch:
+  - `113` terminal opens
+  - `887` special-wire opens
+  - surviving terminals are effectively all `VDD` (`VSS` drops to `1`)
+  - surviving special-wire opens are entirely `VDD`
+- Breakdown from the report:
+  - top predictor columns remain the dominant `VDD` issue
+  - the dcache band is still present, and a new lower-left cache-side `VDD` band appears
+  - but the mixed `VDD/VSS` special-wire failure mode is gone in this branch
+- This is not final closure, but it is still a meaningful reduction:
+  - the macro-present PG problem is now a **single-net** reconnect problem
+  - the next targeted work should stay on narrow `VDD` reconnect in the remaining cache/predictor bands, not broad mixed-net PG repair
