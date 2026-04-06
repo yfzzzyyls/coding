@@ -1945,3 +1945,44 @@ Do not call it a logic bug. First check whether the program eventually reaches t
 - The practical next move is to locally relax or refine the offending
   `M5/M6` simple signal-halo blockage pattern around predictor / BTB, reroute,
   and then perform a routed-db `VPP/VBB` cleanup pass.
+
+### DRC Closure On `out_simple`
+- The routed `286` DRC issue was fully root-caused.
+- On the routed `route_clean.enc` checkpoint, deleting the synthetic
+  `sig_halo_*` M5/M6 signal-halo route blockages drops routed DRC from `286`
+  to `0`.
+- This proved the remaining routed DRC was not true wire-wire damage. It was
+  regular wire intersecting the temporary simple-flow macro signal halos.
+- The Innovus flow was updated so the simple-flow route-report stage removes
+  `sig_halo_*` before final signoff-style DRC reporting.
+- Re-running the report stage from `route_clean.enc` now gives:
+  - `route_drc.rpt`: `0`
+  - `route_connectivity.rpt`: `0`
+
+### Routed Special-Net Truth State
+- The old `1000` capped `VPP`-open report was mostly a body-bias accounting
+  artifact from binding `VPP/VBB` directly into the final `VDD/VSS`
+  connectivity gate.
+- Re-running the routed report from `route_clean.enc` with
+  `RSD_CONNECT_BODY_BIAS=0` gives the real routed special-net state:
+  - `270` terminal opens
+  - `730` special-wire opens
+- The opens are no longer vague. They cluster into repeated tap/row bands:
+  - `VDD`: `y≈211`, `428`, `497`, with smaller bands at `537/662/937`
+  - `VSS`: `y≈100`, `622`, `778`, `902`, `1062`, `1234`
+- The terminal entries are dominated by explicit `TAP_* /VDD` or `TAP_* /VSS`
+  pins, which means the remaining routed problem is a row-rail / tap attach
+  problem, not a general signal-routing problem.
+
+### Failed Routed Special-Net Experiment
+- A first routed special-net repair experiment was tried from `route_clean.enc`:
+  - add exact-band M10 horizontal straps on the routed open bands
+  - then run `sroute` to connect floating stripes and core pins
+- This did **not** help.
+- The log showed:
+  - floating-stripe pass created `0` wires
+  - core-pin attach routed `0` core ports and left `14514` open
+- Conclusion:
+  - upper-metal-only band straps are not enough
+  - the next meaningful fix must be low-layer exact-band row attachment, not
+    more M10-only stitching
